@@ -215,12 +215,13 @@ class FactoryDevice:
 # TODO - stop using wg-quick and use low-level "wg" command instead. It allows
 #        us to use "wg syncconf" so that changes don't bring things down/up
 class WgServer:
-    def __init__(self, privkey: str, endpoint, addr: str, port: int, api: "FactoryApi"):
+    def __init__(self, privkey: str, endpoint, addr: str, port: int, api: "FactoryApi", allow_device_to_device: bool = False):
         self.privkey = privkey
         self.api = api
         self.port = port
         self.addr = addr
         self.endpoint = endpoint
+        self.allow_device_to_device = allow_device_to_device
 
     def _gen_conf(self, factory: str, f: TextIO, no_sysctl: bool):
         intf = """
@@ -251,12 +252,18 @@ PostDown = iptables -t nat -D POSTROUTING -o {intf} -j MASQUERADE
         f.write("\n")
 
         for device in FactoryDevice.iter_vpn_enabled(factory, self.api):
+            # Use subnet AllowedIPs for device-to-device communication, or device-specific IP
+            if self.allow_device_to_device:
+                allowed_ips = "10.42.42.0/24"
+            else:
+                allowed_ips = device.ip
+            
             peer = """# {name}
 [Peer]
 PublicKey = {key}
-AllowedIPs = {ip}
+AllowedIPs = {allowed_ips}
             """.format(
-                name=device.name, key=device.pubkey, ip=device.ip
+                name=device.name, key=device.pubkey, ip=device.ip, allowed_ips=allowed_ips
             )
             f.write(peer.strip())
             f.write("\n")
@@ -267,6 +274,23 @@ AllowedIPs = {ip}
         return buf.getvalue()
 
     def apply_conf(self, factory: str, conf: str, intf_name: str):
+        # Remove existing device peers before applying config when device-to-device is enabled
+        # This ensures AllowedIPs are set correctly even when peers have active endpoints
+        if self.allow_device_to_device:
+            try:
+                for device in FactoryDevice.iter_vpn_enabled(factory, self.api):
+                    try:
+                        subprocess.run(
+                            ["wg", "set", intf_name, "peer", device.pubkey, "remove"],
+                            check=False,
+                            capture_output=True,
+                            timeout=5
+                        )
+                    except Exception:
+                        pass  # Ignore errors if peer doesn't exist or interface doesn't exist
+            except Exception:
+                pass  # Ignore errors if interface doesn't exist
+        
         with open("/etc/wireguard/%s.conf" % intf_name, "w") as f:
             os.fchmod(f.fileno(), 0o700)
             f.write(conf)
@@ -495,7 +519,7 @@ def daemon(args):
         pkey = f.read().strip()
 
     log.info("Creating initial server configuration")
-    wgserver = WgServer.load_from_factory(args.api, args.factory, pkey)
+    wgserver = WgServer.load_from_factory(args.api, args.factory, pkey, args.allow_device_to_device)
 
     cur_conf = ""
     while True:
@@ -518,7 +542,7 @@ def enable_run(args):
 def update_endpoint(args):
     with open(args.privatekey) as f:
         pkey = f.read().strip()
-    wgserver = WgServer.load_from_factory(args.api, args.factory, pkey)
+    wgserver = WgServer.load_from_factory(args.api, args.factory, pkey, args.allow_device_to_device)
 
     if not args.endpoint:
         args.endpoint = WgServer.probe_external_ip()

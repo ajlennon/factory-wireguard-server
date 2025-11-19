@@ -36,7 +36,8 @@ to simply be:
  $ ssh fio@test-device
 ~~~
 
-NOTE: devices can only access the VPN server. They can't see/access each other.
+NOTE: By default, devices can only access the VPN server. They can't see/access each other.
+Use the `--allow-device-to-device` flag to enable device-to-device communication.
 
 ## Debugging
 
