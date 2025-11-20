@@ -583,10 +583,19 @@ def update_dns(factory: str, intf_name: str):
     # by the device's public key. So we then look at the
     # FactoryDevice.ip_cache to figure out the device name
     hosts_by_pub = {v[0]: k for k, v in FactoryDevice.ip_cache.items()}
+    # Also create reverse mapping: pubkey -> (device_name, device_ip)
+    pubkey_to_device = {v[0]: (k, v[1]) for k, v in FactoryDevice.ip_cache.items()}
     hosts = ""
     for peer in WgPeer.iter_all(intf_name):
         host = hosts_by_pub[peer.pubkey]
-        hosts += peer.ip + "\t" + host + "\n"
+        # Use device IP from cache if available (more reliable than parsing from wg show)
+        # When allowed ips is a subnet (e.g., 10.42.42.0/24), peer.ip will be the network address
+        # which is incorrect. Use the actual device IP from the Foundries API instead.
+        if peer.pubkey in pubkey_to_device:
+            device_ip = pubkey_to_device[peer.pubkey][1]
+        else:
+            device_ip = peer.ip
+        hosts += device_ip + "\t" + host + "\n"
 
     with open("/etc/hosts") as f:
         content = f.read()
