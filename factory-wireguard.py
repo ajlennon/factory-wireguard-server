@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import fcntl
+import ipaddress
 import json
 import logging
 import os
@@ -259,7 +260,10 @@ PostDown = iptables -t nat -D POSTROUTING -o {intf} -j MASQUERADE
         for device in FactoryDevice.iter_vpn_enabled(factory, self.api):
             # Use subnet AllowedIPs for device-to-device communication, or device-specific IP
             if self.allow_device_to_device:
-                allowed_ips = "10.42.42.0/24"
+                # Derive subnet from VPN address (e.g., 10.42.42.1 -> 10.42.42.0/24)
+                vpn_ip = ipaddress.IPv4Address(self.addr)
+                subnet = ipaddress.IPv4Network(f"{vpn_ip}/24", strict=False)
+                allowed_ips = str(subnet)
             else:
                 allowed_ips = device.ip
 
@@ -300,7 +304,7 @@ AllowedIPs = {allowed_ips}
                                 ip = parts[1]
                                 comment = " ".join(parts[2:]) if len(parts) > 2 else ""
                                 clients.append((pubkey, ip, comment))
-            except Exception as e:
+            except (IOError, OSError) as e:
                 log.warning(f"Failed to load client peers from {config_file}: {e}")
         return clients
 
@@ -319,7 +323,13 @@ AllowedIPs = {allowed_ips}
         for pubkey, ip, comment in clients:
             try:
                 # Use subnet AllowedIPs for device-to-device communication
-                allowed_ips = "10.42.42.0/24" if self.allow_device_to_device else f"{ip}/32"
+                if self.allow_device_to_device:
+                    # Derive subnet from VPN address (e.g., 10.42.42.1 -> 10.42.42.0/24)
+                    vpn_ip = ipaddress.IPv4Address(self.addr)
+                    subnet = ipaddress.IPv4Network(f"{vpn_ip}/24", strict=False)
+                    allowed_ips = str(subnet)
+                else:
+                    allowed_ips = f"{ip}/32"
                 subprocess.run(
                     ["wg", "set", intf_name, "peer", pubkey, "allowed-ips", allowed_ips],
                     check=False,
@@ -327,7 +337,7 @@ AllowedIPs = {allowed_ips}
                     timeout=5,
                 )
                 log.info(f"Applied client peer: {ip} ({comment if comment else pubkey[:8]}...)")
-            except Exception as e:
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
                 log.warning(f"Failed to apply client peer {pubkey[:8]}...: {e}")
 
     def apply_conf(self, factory: str, conf: str, intf_name: str):
@@ -624,7 +634,7 @@ def daemon(args):
         if result.returncode == 0:
             log.info("Interface exists, applying client peers")
             wgserver.apply_client_peers(args.intf_name)
-    except Exception as e:
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         log.debug(f"Could not check interface status: {e}")
 
     cur_conf = ""
