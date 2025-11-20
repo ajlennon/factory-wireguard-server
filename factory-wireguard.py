@@ -443,7 +443,7 @@ AllowedIPs = {allowed_ips}
             elif k == "server_address":
                 addr = v.strip()
         if addr and port and endpoint:
-            return cls(pkey, endpoint, addr, port, api)
+            return cls(pkey, endpoint, addr, port, api, allow_device_to_device)
         log.error("Invalid server configuration in factory: " + buf)
         sys.exit(1)
 
