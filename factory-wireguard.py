@@ -304,7 +304,7 @@ AllowedIPs = {allowed_ips}
                                 ip = parts[1]
                                 comment = " ".join(parts[2:]) if len(parts) > 2 else ""
                                 clients.append((pubkey, ip, comment))
-            except (IOError, OSError) as e:
+            except OSError as e:
                 log.warning(f"Failed to load client peers from {config_file}: {e}")
         return clients
 
