@@ -8,7 +8,6 @@ import struct
 import subprocess
 import sys
 import time
-
 from argparse import ArgumentParser
 from io import StringIO
 from typing import Dict, Iterable, Optional, TextIO, Tuple
@@ -201,9 +200,7 @@ class FactoryDevice:
         return self.name + " - " + self.ip
 
     @classmethod
-    def iter_vpn_enabled(
-        cls, factory: str, api: FactoryApi
-    ) -> Iterable["FactoryDevice"]:
+    def iter_vpn_enabled(cls, factory: str, api: FactoryApi) -> Iterable["FactoryDevice"]:
         items = api.get("/ota/factories/" + factory + "/wireguard-ips/")
         cls.ip_cache = {}
         for item in items:
@@ -215,7 +212,15 @@ class FactoryDevice:
 # TODO - stop using wg-quick and use low-level "wg" command instead. It allows
 #        us to use "wg syncconf" so that changes don't bring things down/up
 class WgServer:
-    def __init__(self, privkey: str, endpoint, addr: str, port: int, api: "FactoryApi", allow_device_to_device: bool = False):
+    def __init__(
+        self,
+        privkey: str,
+        endpoint,
+        addr: str,
+        port: int,
+        api: "FactoryApi",
+        allow_device_to_device: bool = False,
+    ):
         self.privkey = privkey
         self.api = api
         self.port = port
@@ -257,14 +262,12 @@ PostDown = iptables -t nat -D POSTROUTING -o {intf} -j MASQUERADE
                 allowed_ips = "10.42.42.0/24"
             else:
                 allowed_ips = device.ip
-            
-            peer = """# {name}
+
+            peer = f"""# {device.name}
 [Peer]
-PublicKey = {key}
+PublicKey = {device.pubkey}
 AllowedIPs = {allowed_ips}
-            """.format(
-                name=device.name, key=device.pubkey, ip=device.ip, allowed_ips=allowed_ips
-            )
+            """
             f.write(peer.strip())
             f.write("\n")
 
@@ -272,6 +275,60 @@ AllowedIPs = {allowed_ips}
         buf = StringIO()
         self._gen_conf(factory, buf, no_sysctl)
         return buf.getvalue()
+
+    def load_client_peers(self, config_file: str = "/etc/wireguard/factory-clients.conf"):
+        """
+        Load client peers from config file.
+
+        Config file format (one peer per line):
+        <public_key> <assigned_ip> [comment]
+
+        Example:
+        mzHaZPGowqqzAa5tVFQJs0zoWuDVLppt44HwgdcPXkg= 10.42.42.10 ajlennon
+        7WR3aejgU53i+/MiJcpdboASPgjLihXApnhHj4SRukE= 10.42.42.11 engineer2
+        """
+        clients = []
+        if os.path.exists(config_file):
+            try:
+                with open(config_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                pubkey = parts[0]
+                                ip = parts[1]
+                                comment = " ".join(parts[2:]) if len(parts) > 2 else ""
+                                clients.append((pubkey, ip, comment))
+            except Exception as e:
+                log.warning(f"Failed to load client peers from {config_file}: {e}")
+        return clients
+
+    def apply_client_peers(self, intf_name: str):
+        """
+        Apply client peers from config file to WireGuard interface.
+
+        Client peers are managed separately from device peers (which come from FoundriesFactory API).
+        This allows persistent client peer management via config file.
+        """
+        clients = self.load_client_peers()
+        if not clients:
+            return
+
+        log.info(f"Applying {len(clients)} client peer(s) from config file")
+        for pubkey, ip, comment in clients:
+            try:
+                # Use subnet AllowedIPs for device-to-device communication
+                allowed_ips = "10.42.42.0/24" if self.allow_device_to_device else f"{ip}/32"
+                subprocess.run(
+                    ["wg", "set", intf_name, "peer", pubkey, "allowed-ips", allowed_ips],
+                    check=False,
+                    capture_output=True,
+                    timeout=5,
+                )
+                log.info(f"Applied client peer: {ip} ({comment if comment else pubkey[:8]}...)")
+            except Exception as e:
+                log.warning(f"Failed to apply client peer {pubkey[:8]}...: {e}")
 
     def apply_conf(self, factory: str, conf: str, intf_name: str):
         # Remove existing device peers before applying config when device-to-device is enabled
@@ -284,21 +341,62 @@ AllowedIPs = {allowed_ips}
                             ["wg", "set", intf_name, "peer", device.pubkey, "remove"],
                             check=False,
                             capture_output=True,
-                            timeout=5
+                            timeout=5,
                         )
                     except Exception:
                         pass  # Ignore errors if peer doesn't exist or interface doesn't exist
+                # Wait for peers to be fully removed and prevent immediate reconnection
+                import time
+
+                time.sleep(10)  # Wait longer for peers to fully disconnect
             except Exception:
                 pass  # Ignore errors if interface doesn't exist
-        
+
+        # Write config file
         with open("/etc/wireguard/%s.conf" % intf_name, "w") as f:
             os.fchmod(f.fileno(), 0o700)
             f.write(conf)
+
+        # Apply config - wg syncconf doesn't support wg-quick directives (Address, PostUp, etc.)
+        # So we always use wg-quick for configs with wg-quick directives
+        # Check if interface exists first
+        interface_exists = False
         try:
-            subprocess.check_call(["wg-quick", "down", intf_name])
-        except subprocess.CalledProcessError:
-            log.info("Unable to take VPN down. Assuming initial invocation")
-        subprocess.check_call(["wg-quick", "up", intf_name])
+            result = subprocess.run(
+                ["ip", "link", "show", intf_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            interface_exists = result.returncode == 0
+        except Exception:
+            pass
+
+        if interface_exists:
+            # Interface exists - try to use wg-quick down/up to apply changes
+            # This preserves the interface while updating config
+            try:
+                subprocess.check_call(["wg-quick", "down", intf_name], timeout=10)
+                subprocess.check_call(["wg-quick", "up", intf_name], timeout=10)
+            except subprocess.CalledProcessError as e:
+                log.warning("wg-quick down/up failed, trying full restart: %s", e)
+                # Fall through to full restart
+                try:
+                    subprocess.check_call(["wg-quick", "down", intf_name], timeout=10)
+                except subprocess.CalledProcessError:
+                    pass  # Ignore if already down
+                subprocess.check_call(["wg-quick", "up", intf_name], timeout=10)
+        else:
+            # Interface doesn't exist - initial setup
+            try:
+                subprocess.check_call(["wg-quick", "up", intf_name], timeout=10)
+            except subprocess.CalledProcessError as e:
+                log.error("Failed to bring up interface: %s", e)
+                raise
+
+        # Apply client peers from config file (after interface is up)
+        self.apply_client_peers(intf_name)
 
     @staticmethod
     def probe_external_ip():
@@ -314,11 +412,13 @@ AllowedIPs = {allowed_ips}
     @staticmethod
     def derive_pubkey(priv: bytes) -> bytes:
         return subprocess.run(
-            ["wg", "pubkey"], input=priv, stdout=subprocess.PIPE
+            ["wg", "pubkey"], check=False, input=priv, stdout=subprocess.PIPE
         ).stdout
 
     @classmethod
-    def load_from_factory(cls, api: FactoryApi, factory: str, pkey: str) -> "WgServer":
+    def load_from_factory(
+        cls, api: FactoryApi, factory: str, pkey: str, allow_device_to_device: bool = False
+    ) -> "WgServer":
         buf = api.wgserver_config(factory)
         endpoint = addr = port = None
         for line in buf.splitlines():
@@ -339,13 +439,11 @@ AllowedIPs = {allowed_ips}
 
     def patch_config(self, factory: str):
         pub = self.derive_pubkey(self.privkey.encode()).decode()
-        cfgfile = """
-    endpoint={endpoint}:{port}
-    server_address={addr}
+        cfgfile = f"""
+    endpoint={self.endpoint}:{self.port}
+    server_address={self.addr}
     pubkey={pub}
-        """.format(
-            endpoint=self.endpoint, addr=self.addr, pub=pub, port=self.port
-        )
+        """
         data = {
             "reason": "Enable Wireguard for factory",
             "files": [
@@ -410,10 +508,7 @@ def configure_factory(args):
             s.bind((args.endpoint, args.port))
             s.close()
         except OSError:
-            sys.exit(
-                "ERROR: A UDP socket is already opened on %s:%d"
-                % (args.endpoint, args.port)
-            )
+            sys.exit("ERROR: A UDP socket is already opened on %s:%d" % (args.endpoint, args.port))
     _assert_ip(args.vpnaddr)
 
     try:
@@ -445,7 +540,7 @@ def enable_for_factory(args):
 
     with open("/etc/systemd/system/" + svc, "w") as f:
         f.write(
-            """
+            f"""
 [Unit]
 Description=Factory VPN Daemon
 After=network.target
@@ -454,18 +549,12 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory={here}
-ExecStart=/usr/bin/python3 ./factory-wireguard.py -n {intf} -f {factory} {authparam} -k {key} daemon
+ExecStart=/usr/bin/python3 ./factory-wireguard.py -n {args.intf_name} -f {args.factory} {authparam} -k {args.privatekey} daemon
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
-        """.format(
-                here=here,
-                factory=args.factory,
-                authparam=authparam,
-                key=args.privatekey,
-                intf=args.intf_name,
-            )
+        """
         )
     try:
         subprocess.check_call(["systemctl", "enable", svc])
@@ -521,6 +610,23 @@ def daemon(args):
     log.info("Creating initial server configuration")
     wgserver = WgServer.load_from_factory(args.api, args.factory, pkey, args.allow_device_to_device)
 
+    # Apply client peers on initial startup (before main loop)
+    # This ensures client peers are loaded even if interface already exists
+    try:
+        # Check if interface exists
+        result = subprocess.run(
+            ["ip", "link", "show", args.intf_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            log.info("Interface exists, applying client peers")
+            wgserver.apply_client_peers(args.intf_name)
+    except Exception as e:
+        log.debug(f"Could not check interface status: {e}")
+
     cur_conf = ""
     while True:
         log.info("Looking for factory config changes")
@@ -542,7 +648,8 @@ def enable_run(args):
 def update_endpoint(args):
     with open(args.privatekey) as f:
         pkey = f.read().strip()
-    wgserver = WgServer.load_from_factory(args.api, args.factory, pkey, args.allow_device_to_device)
+    allow_device_to_device = getattr(args, "allow_device_to_device", False)
+    wgserver = WgServer.load_from_factory(args.api, args.factory, pkey, allow_device_to_device)
 
     if not args.endpoint:
         args.endpoint = WgServer.probe_external_ip()
@@ -578,15 +685,11 @@ def _assert_installed():
 def _get_args():
     parser = ArgumentParser(description="Manage a Wireguard VPN for Factory devices")
     auth_group = parser.add_mutually_exclusive_group(required=True)
-    auth_group.add_argument(
-        "--apitoken", "-t", help="API token to access api.foundries.io"
-    )
+    auth_group.add_argument("--apitoken", "-t", help="API token to access api.foundries.io")
     auth_group.add_argument(
         "--oauthcreds", "-a", help="OAuth2 credentials file for api.foundries.io"
     )
-    parser.add_argument(
-        "--factory", "-f", required=True, help="Foundries Factory to work with"
-    )
+    parser.add_argument("--factory", "-f", required=True, help="Foundries Factory to work with")
     parser.add_argument(
         "--intf-name",
         "-n",
@@ -621,9 +724,7 @@ def _get_args():
     )
     p.add_argument("--no-check-ip", action="store_true", help="Don't check external IP")
 
-    p = sub.add_parser(
-        "daemon", help="Keep wireguard server in sync with Factory devices"
-    )
+    p = sub.add_parser("daemon", help="Keep wireguard server in sync with Factory devices")
     p.set_defaults(func=daemon)
     p.add_argument(
         "--interval",
@@ -631,6 +732,11 @@ def _get_args():
         type=int,
         default=300,
         help="How often to sync device settings. default=%(default)d seconds",
+    )
+    p.add_argument(
+        "--allow-device-to-device",
+        action="store_true",
+        help="Allow device-to-device communication by setting AllowedIPs to subnet (10.42.42.0/24) instead of individual device IPs",
     )
     p = sub.add_parser(
         "enable_run",
@@ -659,25 +765,29 @@ def _get_args():
         help="VPN address for this server. Default=%(default)s",
     )
     p.add_argument("--no-check-ip", action="store_true", help="Don't check external IP")
+    p.add_argument(
+        "--allow-device-to-device",
+        action="store_true",
+        help="Allow device-to-device communication by setting AllowedIP to subnet (10.42.42.0/24) instead of individual device IPs",
+    )
 
     p = sub.add_parser("update_endpoint", help="Update VPN server endpoint")
     p.set_defaults(func=update_endpoint)
     p.add_argument(
-        "--port", "-p", type=int, help="External port for clients to connect to.",
+        "--port",
+        "-p",
+        type=int,
+        help="External port for clients to connect to.",
     )
     p.add_argument("--endpoint", "-e", help="External IP devices will connect to")
 
     args = parser.parse_args()
     if len(args.factory) > 12 and not args.intf_name:
-        sys.exit(
-            "ERROR: --intf-name argument is required when factory name >12 characters"
-        )
+        sys.exit("ERROR: --intf-name argument is required when factory name >12 characters")
     elif not args.intf_name:
         args.intf_name = "fio" + args.factory
     if len(args.intf_name) > 15:
-        sys.exit(
-            "ERROR: --intf-name argument is too long. Max length is 15 characters."
-        )
+        sys.exit("ERROR: --intf-name argument is too long. Max length is 15 characters.")
     return args
 
 
