@@ -228,6 +228,13 @@ class WgServer:
         self.addr = addr
         self.endpoint = endpoint
         self.allow_device_to_device = allow_device_to_device
+        # Calculate subnet once in constructor for efficiency
+        if self.allow_device_to_device:
+            vpn_ip = ipaddress.IPv4Address(self.addr)
+            subnet = ipaddress.IPv4Network(f"{vpn_ip}/24", strict=False)
+            self.allowed_ips_subnet = str(subnet)
+        else:
+            self.allowed_ips_subnet = None
 
     def _gen_conf(self, factory: str, f: TextIO, no_sysctl: bool):
         intf = """
@@ -259,13 +266,7 @@ PostDown = iptables -t nat -D POSTROUTING -o {intf} -j MASQUERADE
 
         for device in FactoryDevice.iter_vpn_enabled(factory, self.api):
             # Use subnet AllowedIPs for device-to-device communication, or device-specific IP
-            if self.allow_device_to_device:
-                # Derive subnet from VPN address (e.g., 10.42.42.1 -> 10.42.42.0/24)
-                vpn_ip = ipaddress.IPv4Address(self.addr)
-                subnet = ipaddress.IPv4Network(f"{vpn_ip}/24", strict=False)
-                allowed_ips = str(subnet)
-            else:
-                allowed_ips = device.ip
+            allowed_ips = self.allowed_ips_subnet if self.allow_device_to_device else device.ip
 
             peer = f"""# {device.name}
 [Peer]
@@ -280,7 +281,7 @@ AllowedIPs = {allowed_ips}
         self._gen_conf(factory, buf, no_sysctl)
         return buf.getvalue()
 
-    def load_client_peers(self, config_file: str = "/etc/wireguard/factory-clients.conf"):
+    def load_client_peers(self, intf_name: Optional[str] = None, config_file: Optional[str] = None):
         """
         Load client peers from config file.
 
@@ -290,7 +291,14 @@ AllowedIPs = {allowed_ips}
         Example:
         mzHaZPGowqqzAa5tVFQJs0zoWuDVLppt44HwgdcPXkg= 10.42.42.10 ajlennon
         7WR3aejgU53i+/MiJcpdboASPgjLihXApnhHj4SRukE= 10.42.42.11 engineer2
+
+        If config_file is not provided, uses instance-specific path:
+        /etc/wireguard/factory-clients-{interface_name}.conf
         """
+        if config_file is None:
+            if not intf_name:
+                raise ValueError("intf_name must be provided to use default config file path")
+            config_file = f"/etc/wireguard/factory-clients-{intf_name}.conf"
         clients = []
         if os.path.exists(config_file):
             try:
@@ -315,21 +323,15 @@ AllowedIPs = {allowed_ips}
         Client peers are managed separately from device peers (which come from FoundriesFactory API).
         This allows persistent client peer management via config file.
         """
-        clients = self.load_client_peers()
+        clients = self.load_client_peers(intf_name)
         if not clients:
             return
 
         log.info(f"Applying {len(clients)} client peer(s) from config file")
         for pubkey, ip, comment in clients:
             try:
-                # Use subnet AllowedIPs for device-to-device communication
-                if self.allow_device_to_device:
-                    # Derive subnet from VPN address (e.g., 10.42.42.1 -> 10.42.42.0/24)
-                    vpn_ip = ipaddress.IPv4Address(self.addr)
-                    subnet = ipaddress.IPv4Network(f"{vpn_ip}/24", strict=False)
-                    allowed_ips = str(subnet)
-                else:
-                    allowed_ips = f"{ip}/32"
+                # Use subnet AllowedIPs for device-to-device communication, or device-specific IP
+                allowed_ips = self.allowed_ips_subnet if self.allow_device_to_device else f"{ip}/32"
                 subprocess.run(
                     ["wg", "set", intf_name, "peer", pubkey, "allowed-ips", allowed_ips],
                     check=False,
@@ -340,27 +342,36 @@ AllowedIPs = {allowed_ips}
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
                 log.warning(f"Failed to apply client peer {pubkey[:8]}...: {e}")
 
+    def _remove_device_peers(self, factory: str, intf_name: str):
+        """
+        Remove existing device peers before applying config when device-to-device is enabled.
+        This ensures AllowedIPs are set correctly even when peers have active endpoints.
+        """
+        if not self.allow_device_to_device:
+            return
+
+        try:
+            for device in FactoryDevice.iter_vpn_enabled(factory, self.api):
+                try:
+                    subprocess.check_output(
+                        ["wg", "set", intf_name, "peer", device.pubkey, "remove"],
+                        timeout=5,
+                        stderr=subprocess.DEVNULL,  # Suppress expected error messages
+                    )
+                except subprocess.CalledProcessError:
+                    log.debug(f"Peer {device.pubkey[:8]}... not found (expected if new peer)")
+                except subprocess.TimeoutExpired:
+                    log.warning(f"Timeout removing peer {device.pubkey[:8]}...")
+                except Exception as e:
+                    log.warning(f"Unexpected error removing peer {device.pubkey[:8]}...: {e}")
+            # Wait for peers to be fully removed and prevent immediate reconnection
+            time.sleep(10)  # Wait longer for peers to fully disconnect
+        except Exception:
+            pass  # Ignore errors if interface doesn't exist
+
     def apply_conf(self, factory: str, conf: str, intf_name: str):
         # Remove existing device peers before applying config when device-to-device is enabled
-        # This ensures AllowedIPs are set correctly even when peers have active endpoints
-        if self.allow_device_to_device:
-            try:
-                for device in FactoryDevice.iter_vpn_enabled(factory, self.api):
-                    try:
-                        subprocess.run(
-                            ["wg", "set", intf_name, "peer", device.pubkey, "remove"],
-                            check=False,
-                            capture_output=True,
-                            timeout=5,
-                        )
-                    except Exception:
-                        pass  # Ignore errors if peer doesn't exist or interface doesn't exist
-                # Wait for peers to be fully removed and prevent immediate reconnection
-                import time
-
-                time.sleep(10)  # Wait longer for peers to fully disconnect
-            except Exception:
-                pass  # Ignore errors if interface doesn't exist
+        self._remove_device_peers(factory, intf_name)
 
         # Write config file
         with open("/etc/wireguard/%s.conf" % intf_name, "w") as f:
@@ -421,9 +432,12 @@ AllowedIPs = {allowed_ips}
 
     @staticmethod
     def derive_pubkey(priv: bytes) -> bytes:
-        return subprocess.run(
-            ["wg", "pubkey"], check=False, input=priv, stdout=subprocess.PIPE
-        ).stdout
+        try:
+            return subprocess.check_output(
+                ["wg", "pubkey"], input=priv, stderr=subprocess.DEVNULL
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to derive public key: {e}") from e
 
     @classmethod
     def load_from_factory(
