@@ -433,9 +433,7 @@ AllowedIPs = {allowed_ips}
     @staticmethod
     def derive_pubkey(priv: bytes) -> bytes:
         try:
-            return subprocess.check_output(
-                ["wg", "pubkey"], input=priv, stderr=subprocess.DEVNULL
-            )
+            return subprocess.check_output(["wg", "pubkey"], input=priv, stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to derive public key: {e}") from e
 
